@@ -14,11 +14,14 @@ import (
 const (
 	writeStateHealthy  = "healthy"
 	writeStateDegraded = "degraded"
+
+	blockReasonS3BackendDown      = "s3_backend_down"
+	blockReasonWriteHealthDegraded = "write_health_degraded"
 )
 
 type writeHealthConfig struct {
-	enabled           bool
-	interval          time.Duration
+	enabled            bool
+	interval           time.Duration
 	unhealthyThreshold int
 	recoveryThreshold  int
 	putBlockStatus     int
@@ -35,14 +38,15 @@ type writeHealthCheck struct {
 type writeHealthMonitor struct {
 	cfg writeHealthConfig
 
-	mu                 sync.RWMutex
-	state              string
-	consecutiveFails     int
-	consecutiveOK        int
-	lastReason           string
-	lastCheck            time.Time
-	httpClient           *http.Client
-	transitionLogEnabled bool
+	mu                   sync.RWMutex
+	state                string
+	consecutiveFails       int
+	consecutiveOK          int
+	lastReason             string
+	lastDegradedReason     string
+	lastCheck              time.Time
+	httpClient             *http.Client
+	transitionLogEnabled   bool
 }
 
 func newWriteHealthMonitor(cfg writeHealthConfig, transitionLogEnabled bool) *writeHealthMonitor {
@@ -53,7 +57,7 @@ func newWriteHealthMonitor(cfg writeHealthConfig, transitionLogEnabled bool) *wr
 		cfg.interval = 3 * time.Second
 	}
 	if cfg.unhealthyThreshold <= 0 {
-		cfg.unhealthyThreshold = 2
+		cfg.unhealthyThreshold = 1
 	}
 	if cfg.recoveryThreshold <= 0 {
 		cfg.recoveryThreshold = 2
@@ -62,7 +66,7 @@ func newWriteHealthMonitor(cfg writeHealthConfig, transitionLogEnabled bool) *wr
 		cfg.putBlockStatus = http.StatusServiceUnavailable
 	}
 	if cfg.timeout <= 0 {
-		cfg.timeout = 5 * time.Second
+		cfg.timeout = time.Second
 	}
 	return &writeHealthMonitor{
 		cfg:                  cfg,
@@ -95,10 +99,26 @@ func (m *writeHealthMonitor) runOnce() {
 }
 
 func (m *writeHealthMonitor) probeAll() (bool, string) {
-	var reasons []string
+	type result struct {
+		name string
+		err  error
+	}
+	ch := make(chan result, len(m.cfg.checks))
+	var wg sync.WaitGroup
 	for _, check := range m.cfg.checks {
-		if err := m.probe(check); err != nil {
-			reasons = append(reasons, fmt.Sprintf("%s: %v", check.name, err))
+		wg.Add(1)
+		go func(c writeHealthCheck) {
+			defer wg.Done()
+			ch <- result{name: c.name, err: m.probe(c)}
+		}(check)
+	}
+	wg.Wait()
+	close(ch)
+
+	var reasons []string
+	for r := range ch {
+		if r.err != nil {
+			reasons = append(reasons, fmt.Sprintf("%s: %v", r.name, r.err))
 		}
 	}
 	if len(reasons) > 0 {
@@ -133,29 +153,75 @@ func (m *writeHealthMonitor) probe(check writeHealthCheck) error {
 	return nil
 }
 
+func classifyDegradedReason(raw string) string {
+	lower := strings.ToLower(raw)
+	switch {
+	case raw == blockReasonS3BackendDown || strings.Contains(lower, "s3:"):
+		return "s3_down"
+	case strings.Contains(lower, "assign:") && strings.Contains(lower, "406"):
+		return "all_volumes_down"
+	case strings.Contains(lower, "assign:"):
+		return "assign_failed"
+	case strings.Contains(lower, "master:"):
+		return "master_down"
+	case strings.Contains(lower, "filer:"):
+		return "filer_down"
+	default:
+		return "write_unhealthy"
+	}
+}
+
 func (m *writeHealthMonitor) record(ok bool, reason string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	m.lastCheck = time.Now().UTC()
-	m.lastReason = reason
 
 	if ok {
 		m.consecutiveFails = 0
 		m.consecutiveOK++
+		m.lastReason = ""
 		if m.consecutiveOK >= m.cfg.recoveryThreshold && m.state != writeStateHealthy {
 			m.state = writeStateHealthy
-			m.logTransitionLocked("RECOVERED", reason)
+			m.lastDegradedReason = ""
+			m.logTransitionLocked("WRITE_RECOVERED", "")
 		}
 		return
 	}
 
 	m.consecutiveOK = 0
 	m.consecutiveFails++
-	if m.consecutiveFails >= m.cfg.unhealthyThreshold && m.state != writeStateDegraded {
+	m.lastReason = reason
+	degradedReason := classifyDegradedReason(reason)
+	m.lastDegradedReason = degradedReason
+
+	// Fail-fast: first failed probe round marks write path degraded (no multi-round wait).
+	if m.state != writeStateDegraded || m.lastDegradedReason != degradedReason {
 		m.state = writeStateDegraded
-		m.logTransitionLocked("DEGRADED", reason)
+		m.logTransitionLocked("WRITE_DEGRADED", degradedReason)
 	}
+}
+
+func (m *writeHealthMonitor) forceDegrade(rawReason string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	reason := classifyDegradedReason(rawReason)
+	m.lastReason = rawReason
+	m.lastDegradedReason = reason
+	m.consecutiveOK = 0
+	m.consecutiveFails = m.cfg.unhealthyThreshold
+	if m.state != writeStateDegraded {
+		m.state = writeStateDegraded
+		m.logTransitionLocked("WRITE_DEGRADED", reason)
+	}
+}
+
+func (m *writeHealthMonitor) noteUpstreamFailure(rawReason string) {
+	m.forceDegrade(rawReason)
 }
 
 func (m *writeHealthMonitor) logTransitionLocked(event, reason string) {
@@ -166,9 +232,10 @@ func (m *writeHealthMonitor) logTransitionLocked(event, reason string) {
 		Type:     LogMsgType,
 		Status:   event,
 		Endpoint: "write-health",
+		Reason:   reason,
 	}
-	if reason != "" {
-		msg.Error = fmt.Errorf("%s", reason)
+	if reason != "" && strings.HasPrefix(event, "WRITE_DEGRADED") {
+		msg.Error = fmt.Errorf("reason=%s", reason)
 	}
 	_ = logMsg(msg)
 }
@@ -198,16 +265,29 @@ func (m *writeHealthMonitor) degradedReason() string {
 	if m.lastReason != "" {
 		return m.lastReason
 	}
+	if m.lastDegradedReason != "" {
+		return "reason=" + m.lastDegradedReason
+	}
 	return "write cluster degraded"
 }
 
-func (m *writeHealthMonitor) logPutBlocked(method, path string) {
+func (m *writeHealthMonitor) blockPut(w http.ResponseWriter, r *http.Request, blockReason string) {
+	m.logPutBlocked(r.Method, r.URL.Path, blockReason)
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("X-Sideweed-Write-Health", "degraded")
+	w.Header().Set("X-Sideweed-Block-Reason", blockReason)
+	w.WriteHeader(m.putBlockStatus())
+	_, _ = io.WriteString(w, fmt.Sprintf("reason=%s: %s\n", blockReason, m.degradedReason()))
+}
+
+func (m *writeHealthMonitor) logPutBlocked(method, path, blockReason string) {
 	if !m.transitionLogEnabled {
 		return
 	}
 	_ = logMsg(logMessage{
 		Type:     LogMsgType,
 		Status:   "PUT_BLOCKED",
+		Reason:   blockReason,
 		Endpoint: fmt.Sprintf("%s %s", method, path),
 		Error:    fmt.Errorf("%s", m.degradedReason()),
 	})
@@ -252,7 +332,6 @@ func parseHTTPStatusCode(s string) (int, error) {
 	return code, nil
 }
 
-// global for metrics / tests
 var globalWriteHealth atomic.Pointer[writeHealthMonitor]
 
 func setGlobalWriteHealth(m *writeHealthMonitor) {

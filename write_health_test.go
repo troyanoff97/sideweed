@@ -55,6 +55,43 @@ func TestWriteHealthMonitorDegradesOnAssignFailure(t *testing.T) {
 	}
 }
 
+func TestMultisitePut503WhenNoBackendOnline(t *testing.T) {
+	b := &Backend{
+		endpoint: "http://backend:8333",
+		Stats:    &BackendStats{MinLatency: 24 * time.Hour},
+	}
+	b.setOffline()
+
+	monitor := newWriteHealthMonitor(writeHealthConfig{
+		enabled:            true,
+		interval:           time.Hour,
+		recoveryThreshold:  1,
+		putBlockStatus:     http.StatusServiceUnavailable,
+		timeout:            500 * time.Millisecond,
+		checks:             []writeHealthCheck{{name: "s3", url: "http://127.0.0.1:1/healthz"}},
+	}, false)
+	monitor.mu.Lock()
+	monitor.state = writeStateHealthy
+	monitor.mu.Unlock()
+
+	ms := &multisite{sites: []*site{{backends: []*Backend{b}}}, writeHealth: monitor}
+
+	start := time.Now()
+	putRec := httptest.NewRecorder()
+	ms.ServeHTTP(putRec, httptest.NewRequest(http.MethodPut, "/bucket/object", strings.NewReader("data")))
+	elapsed := time.Since(start)
+
+	if putRec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("PUT status=%d want 503", putRec.Code)
+	}
+	if putRec.Header().Get("X-Sideweed-Block-Reason") != blockReasonS3BackendDown {
+		t.Fatalf("block reason=%q", putRec.Header().Get("X-Sideweed-Block-Reason"))
+	}
+	if elapsed > 100*time.Millisecond {
+		t.Fatalf("PUT took %v, want immediate block", elapsed)
+	}
+}
+
 func TestMultisiteBlocksPutAllowsGetWhenDegraded(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

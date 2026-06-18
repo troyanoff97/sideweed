@@ -114,6 +114,8 @@ type logMessage struct {
 	Error error `json:"Error,omitempty"`
 	// Status of endpoint
 	Status string `json:"Status,omitempty"`
+	// Reason for write gate / degradation events
+	Reason string `json:"Reason,omitempty"`
 	// Downtime so far
 	DowntimeDuration time.Duration `json:"Downtime,omitempty"`
 	Timestamp        time.Time
@@ -178,7 +180,13 @@ const (
 )
 
 func (b *Backend) setOffline() {
+	if !b.Online() {
+		return
+	}
 	atomic.StoreInt32(&b.up, offline)
+	if m := globalWriteHealth.Load(); m != nil {
+		m.forceDegrade(blockReasonS3BackendDown)
+	}
 }
 
 func (b *Backend) setOnline() {
@@ -215,12 +223,19 @@ type BackendStats struct {
 
 // ErrorHandler called by httputil.ReverseProxy for errors.
 // Avoid canceled context error since it means the client disconnected.
-func (b *Backend) ErrorHandler(_ http.ResponseWriter, _ *http.Request, err error) {
+func (b *Backend) ErrorHandler(w http.ResponseWriter, r *http.Request, err error) {
 	if err != nil && !errors.Is(err, context.Canceled) {
 		if globalLoggingEnabled {
 			logMsg(logMessage{Endpoint: b.endpoint, Status: "down", Error: err})
 		}
 		b.setOffline()
+		if m := globalWriteHealth.Load(); m != nil {
+			if r != nil && isWriteMethod(r.Method) {
+				m.blockPut(w, r, blockReasonS3BackendDown)
+				return
+			}
+			m.noteUpstreamFailure("s3_down")
+		}
 	}
 }
 
@@ -367,22 +382,39 @@ type multisite struct {
 	writeHealth *writeHealthMonitor
 }
 
-func (m *multisite) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Server", "sideweed") // indicate sideweed is serving the request
+func (m *multisite) anySiteOnline() bool {
 	for _, s := range m.sites {
 		if s.Online() {
-			if r.URL.Path == healthPath {
-				// Health check endpoint should return success
-				return
-			}
-			if isWriteMethod(r.Method) && m.writeHealth != nil && !m.writeHealth.writeAllowed() {
-				m.writeHealth.logPutBlocked(r.Method, r.URL.Path)
-				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-				w.Header().Set("X-Sideweed-Write-Health", "degraded")
-				w.WriteHeader(m.writeHealth.putBlockStatus())
-				_, _ = io.WriteString(w, m.writeHealth.degradedReason()+"\n")
-				return
-			}
+			return true
+		}
+	}
+	return false
+}
+
+func (m *multisite) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Server", "sideweed") // indicate sideweed is serving the request
+
+	if r.URL.Path == healthPath {
+		if m.anySiteOnline() {
+			return
+		}
+		w.WriteHeader(http.StatusBadGateway)
+		return
+	}
+
+	if isWriteMethod(r.Method) && m.writeHealth != nil {
+		if !m.anySiteOnline() {
+			m.writeHealth.blockPut(w, r, blockReasonS3BackendDown)
+			return
+		}
+		if !m.writeHealth.writeAllowed() {
+			m.writeHealth.blockPut(w, r, blockReasonWriteHealthDegraded)
+			return
+		}
+	}
+
+	for _, s := range m.sites {
+		if s.Online() {
 			s.ServeHTTP(w, r)
 			return
 		}
@@ -779,8 +811,8 @@ func main() {
 		},
 		cli.IntFlag{
 			Name:  "write-unhealthy-threshold",
-			Usage: "consecutive failed write health probes before DEGRADED",
-			Value: 2,
+			Usage: "consecutive failed write health probe rounds before WRITE_DEGRADED (1 = immediate)",
+			Value: 1,
 		},
 		cli.IntFlag{
 			Name:  "write-recovery-threshold",
@@ -800,7 +832,7 @@ func main() {
 		cli.DurationFlag{
 			Name:  "write-health-timeout",
 			Usage: "timeout for each write health probe",
-			Value: 5 * time.Second,
+			Value: time.Second,
 		},
 		cli.StringSliceFlag{
 			Name:  "write-health-check",

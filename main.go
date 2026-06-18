@@ -363,7 +363,8 @@ func (b *Backend) updateCallStats(t shortTraceMsg) {
 }
 
 type multisite struct {
-	sites []*site
+	sites       []*site
+	writeHealth *writeHealthMonitor
 }
 
 func (m *multisite) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -372,6 +373,14 @@ func (m *multisite) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if s.Online() {
 			if r.URL.Path == healthPath {
 				// Health check endpoint should return success
+				return
+			}
+			if isWriteMethod(r.Method) && m.writeHealth != nil && !m.writeHealth.writeAllowed() {
+				m.writeHealth.logPutBlocked(r.Method, r.URL.Path)
+				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+				w.Header().Set("X-Sideweed-Write-Health", "degraded")
+				w.WriteHeader(m.writeHealth.putBlockStatus())
+				_, _ = io.WriteString(w, m.writeHealth.degradedReason()+"\n")
 				return
 			}
 			s.ServeHTTP(w, r)
@@ -491,10 +500,13 @@ func newProxyDialContext(dialTimeout time.Duration) DialContext {
 	}
 }
 
-func clientTransport() http.RoundTripper {
+func clientTransport(dialTimeout time.Duration) http.RoundTripper {
+	if dialTimeout <= 0 {
+		dialTimeout = 10 * time.Second
+	}
 	tr := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           dialContextWithoutDNSCache(dnsResolver, newProxyDialContext(10*time.Second)),
+		DialContext:           dialContextWithoutDNSCache(dnsResolver, newProxyDialContext(dialTimeout)),
 		MaxIdleConnsPerHost:   1024,
 		WriteBufferSize:       32 << 10, // 32KiB moving up from 4KiB default
 		ReadBufferSize:        32 << 10, // 32KiB moving up from 4KiB default
@@ -547,7 +559,7 @@ func newBufPool(sz int) httputil.BufferPool {
 	}}
 }
 
-func configureSite(ctx *cli.Context, siteNum int, siteStrs []string, healthCheckPath string, healthCheckPort int, healthCheckDuration time.Duration) *site {
+func configureSite(ctx *cli.Context, siteNum int, siteStrs []string, healthCheckPath string, healthCheckPort int, healthCheckDuration time.Duration, upstreamTimeout time.Duration) *site {
 	var endpoints []string
 
 	if ellipses.HasEllipses(siteStrs...) {
@@ -596,7 +608,7 @@ func configureSite(ctx *cli.Context, siteNum int, siteStrs []string, healthCheck
 				endpoint, ctx.App.Name))
 		}
 		if transport == nil {
-			transport = clientTransport()
+			transport = clientTransport(upstreamTimeout)
 		}
 
 		proxy := &httputil.ReverseProxy{
@@ -667,17 +679,45 @@ func sideweedMain(ctx *cli.Context) {
 		healthReadCheckPath = slashSeparator + healthReadCheckPath
 	}
 
+	var writeChecks []writeHealthCheck
+	for _, raw := range ctx.GlobalStringSlice("write-health-check") {
+		check, err := parseWriteHealthCheckFlag(raw)
+		if err != nil {
+			console.Fatalln(err)
+		}
+		writeChecks = append(writeChecks, check)
+	}
+
 	var sites []*site
 	for i, siteStrs := range ctx.Args() {
 		if i == len(ctx.Args())-1 {
 			healthCheckPath = healthReadCheckPath
 		}
 
-		site := configureSite(ctx, i+1, strings.Split(siteStrs, ","), healthCheckPath, healthCheckPort, healthCheckDuration)
+		site := configureSite(ctx, i+1, strings.Split(siteStrs, ","), healthCheckPath, healthCheckPort, healthCheckDuration, ctx.GlobalDuration("upstream-timeout"))
 		sites = append(sites, site)
 	}
 
-	m := &multisite{sites}
+	writeHealthCfg := writeHealthConfig{
+		enabled:            ctx.GlobalBool("write-health-enabled"),
+		interval:           ctx.GlobalDuration("write-health-interval"),
+		unhealthyThreshold: ctx.GlobalInt("write-unhealthy-threshold"),
+		recoveryThreshold:  ctx.GlobalInt("write-recovery-threshold"),
+		putBlockStatus:     ctx.GlobalInt("put-block-status"),
+		timeout:            ctx.GlobalDuration("write-health-timeout"),
+		checks:             writeChecks,
+	}
+	if writeHealthCfg.interval <= 0 {
+		writeHealthCfg.interval = healthCheckDuration
+	}
+
+	writeMonitor := newWriteHealthMonitor(writeHealthCfg, globalLoggingEnabled)
+	if writeMonitor != nil {
+		writeMonitor.start()
+		setGlobalWriteHealth(writeMonitor)
+	}
+
+	m := &multisite{sites: sites, writeHealth: writeMonitor}
 	initUI(m)
 
 	if globalConsoleDisplay {
@@ -728,6 +768,43 @@ func main() {
 			Name:  "health-duration, d",
 			Usage: "health check duration",
 			Value: 5 * time.Second,
+		},
+		cli.BoolFlag{
+			Name:  "write-health-enabled",
+			Usage: "enable write-cluster health gate (blocks PUT/POST/DELETE when degraded)",
+		},
+		cli.DurationFlag{
+			Name:  "write-health-interval",
+			Usage: "write health probe interval (defaults to health-duration)",
+		},
+		cli.IntFlag{
+			Name:  "write-unhealthy-threshold",
+			Usage: "consecutive failed write health probes before DEGRADED",
+			Value: 2,
+		},
+		cli.IntFlag{
+			Name:  "write-recovery-threshold",
+			Usage: "consecutive successful write health probes before RECOVERED",
+			Value: 2,
+		},
+		cli.IntFlag{
+			Name:  "put-block-status",
+			Usage: "HTTP status returned when blocking writes",
+			Value: http.StatusServiceUnavailable,
+		},
+		cli.DurationFlag{
+			Name:  "upstream-timeout",
+			Usage: "upstream proxy dial/request timeout",
+			Value: 30 * time.Second,
+		},
+		cli.DurationFlag{
+			Name:  "write-health-timeout",
+			Usage: "timeout for each write health probe",
+			Value: 5 * time.Second,
+		},
+		cli.StringSliceFlag{
+			Name:  "write-health-check",
+			Usage: "write health probe as name=url[|expectedStatus] (repeatable)",
 		},
 		cli.BoolFlag{
 			Name:  "log, l",

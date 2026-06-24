@@ -45,6 +45,7 @@ type writeHealthMonitor struct {
 	lastReason           string
 	lastDegradedReason   string
 	lastCheck            time.Time
+	lastProbeResults     []writeProbeLastResult
 	httpClient           *http.Client
 	transitionLogEnabled bool
 }
@@ -96,14 +97,20 @@ func (m *writeHealthMonitor) loop() {
 }
 
 func (m *writeHealthMonitor) runOnce() {
-	ok, reason := m.probeAll()
-	m.record(ok, reason)
+	round := m.probeAll()
+	m.record(round.ok, round.reason, round.probes)
 }
 
-func (m *writeHealthMonitor) probeAll() (bool, string) {
+type probeRound struct {
+	ok     bool
+	reason string
+	probes []writeProbeLastResult
+}
+
+func (m *writeHealthMonitor) probeAll() probeRound {
 	type result struct {
-		name string
-		err  error
+		check writeHealthCheck
+		out   probeOutcome
 	}
 	ch := make(chan result, len(m.cfg.checks))
 	var wg sync.WaitGroup
@@ -111,25 +118,77 @@ func (m *writeHealthMonitor) probeAll() (bool, string) {
 		wg.Add(1)
 		go func(c writeHealthCheck) {
 			defer wg.Done()
-			ch <- result{name: c.name, err: m.probe(c)}
+			ch <- result{check: c, out: m.probe(c)}
 		}(check)
 	}
 	wg.Wait()
 	close(ch)
 
+	probes := make([]writeProbeLastResult, 0, len(m.cfg.checks))
 	var reasons []string
 	for r := range ch {
-		if r.err != nil {
-			reasons = append(reasons, fmt.Sprintf("%s: %v", r.name, r.err))
+		pr := probeResultFromOutcome(r.check, r.out)
+		probes = append(probes, pr)
+		if r.out.err != nil {
+			reasons = append(reasons, fmt.Sprintf("%s: %v", r.check.name, r.out.err))
 		}
 	}
+	sortProbeResults(probes)
+
 	if len(reasons) > 0 {
-		return false, strings.Join(reasons, "; ")
+		return probeRound{ok: false, reason: strings.Join(reasons, "; "), probes: probes}
 	}
-	return true, ""
+	return probeRound{ok: true, probes: probes}
 }
 
-func (m *writeHealthMonitor) probe(check writeHealthCheck) error {
+type probeOutcome struct {
+	statusCode int
+	latency    time.Duration
+	err        error
+}
+
+func probeResultFromOutcome(check writeHealthCheck, out probeOutcome) writeProbeLastResult {
+	pr := writeProbeLastResult{
+		Name:      check.name,
+		URL:       check.url,
+		OK:        out.err == nil,
+		LatencyMS: out.latency.Milliseconds(),
+		CheckedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	if out.statusCode > 0 {
+		pr.StatusCode = out.statusCode
+	}
+	if out.err != nil {
+		pr.Error = out.err.Error()
+	}
+	return pr
+}
+
+func sortProbeResults(probes []writeProbeLastResult) {
+	order := func(name string) int {
+		switch name {
+		case "s3":
+			return 0
+		case "filer":
+			return 1
+		case "master":
+			return 2
+		case "assign":
+			return 3
+		default:
+			return 100
+		}
+	}
+	for i := 0; i < len(probes); i++ {
+		for j := i + 1; j < len(probes); j++ {
+			if order(probes[j].Name) < order(probes[i].Name) {
+				probes[i], probes[j] = probes[j], probes[i]
+			}
+		}
+	}
+}
+
+func (m *writeHealthMonitor) probe(check writeHealthCheck) probeOutcome {
 	start := time.Now()
 	defer func() {
 		observeHealthProbeDuration(check.name, time.Since(start))
@@ -140,12 +199,13 @@ func (m *writeHealthMonitor) probe(check writeHealthCheck) error {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, check.url, nil)
 	if err != nil {
-		return err
+		return probeOutcome{latency: time.Since(start), err: err}
 	}
 
 	resp, err := m.httpClient.Do(req)
+	latency := time.Since(start)
 	if err != nil {
-		return err
+		return probeOutcome{latency: latency, err: err}
 	}
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body)
@@ -155,9 +215,13 @@ func (m *writeHealthMonitor) probe(check writeHealthCheck) error {
 		expect = http.StatusOK
 	}
 	if resp.StatusCode != expect {
-		return fmt.Errorf("status %d want %d", resp.StatusCode, expect)
+		return probeOutcome{
+			statusCode: resp.StatusCode,
+			latency:    latency,
+			err:        fmt.Errorf("status %d want %d", resp.StatusCode, expect),
+		}
 	}
-	return nil
+	return probeOutcome{statusCode: resp.StatusCode, latency: latency}
 }
 
 func classifyDegradedReason(raw string) string {
@@ -178,11 +242,12 @@ func classifyDegradedReason(raw string) string {
 	}
 }
 
-func (m *writeHealthMonitor) record(ok bool, reason string) {
+func (m *writeHealthMonitor) record(ok bool, reason string, probes []writeProbeLastResult) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	m.lastCheck = time.Now().UTC()
+	m.lastProbeResults = probes
 
 	if ok {
 		m.consecutiveFails = 0

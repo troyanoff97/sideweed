@@ -406,6 +406,11 @@ func (m *multisite) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.URL.Path == writeHealthPath {
+		m.serveWriteHealth(w, r)
+		return
+	}
+
 	if isWriteMethod(r.Method) && m.writeHealth != nil {
 		if !m.anySiteOnline() {
 			m.writeHealth.blockPut(w, r, blockReasonS3BackendDown)

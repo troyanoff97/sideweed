@@ -15,7 +15,7 @@ const (
 	writeStateHealthy  = "healthy"
 	writeStateDegraded = "degraded"
 
-	blockReasonS3BackendDown      = "s3_backend_down"
+	blockReasonS3BackendDown       = "s3_backend_down"
 	blockReasonWriteHealthDegraded = "write_health_degraded"
 )
 
@@ -40,13 +40,13 @@ type writeHealthMonitor struct {
 
 	mu                   sync.RWMutex
 	state                string
-	consecutiveFails       int
-	consecutiveOK          int
-	lastReason             string
-	lastDegradedReason     string
-	lastCheck              time.Time
-	httpClient             *http.Client
-	transitionLogEnabled   bool
+	consecutiveFails     int
+	consecutiveOK        int
+	lastReason           string
+	lastDegradedReason   string
+	lastCheck            time.Time
+	httpClient           *http.Client
+	transitionLogEnabled bool
 }
 
 func newWriteHealthMonitor(cfg writeHealthConfig, transitionLogEnabled bool) *writeHealthMonitor {
@@ -68,12 +68,14 @@ func newWriteHealthMonitor(cfg writeHealthConfig, transitionLogEnabled bool) *wr
 	if cfg.timeout <= 0 {
 		cfg.timeout = time.Second
 	}
-	return &writeHealthMonitor{
+	m := &writeHealthMonitor{
 		cfg:                  cfg,
 		state:                writeStateDegraded,
 		httpClient:           &http.Client{Timeout: cfg.timeout},
 		transitionLogEnabled: transitionLogEnabled,
 	}
+	writeHealthStatusGauge.Set(0)
+	return m
 }
 
 func (m *writeHealthMonitor) start() {
@@ -128,6 +130,11 @@ func (m *writeHealthMonitor) probeAll() (bool, string) {
 }
 
 func (m *writeHealthMonitor) probe(check writeHealthCheck) error {
+	start := time.Now()
+	defer func() {
+		observeHealthProbeDuration(check.name, time.Since(start))
+	}()
+
 	ctx, cancel := context.WithTimeout(context.Background(), m.cfg.timeout)
 	defer cancel()
 
@@ -225,6 +232,13 @@ func (m *writeHealthMonitor) noteUpstreamFailure(rawReason string) {
 }
 
 func (m *writeHealthMonitor) logTransitionLocked(event, reason string) {
+	switch event {
+	case "WRITE_DEGRADED":
+		recordWriteDegraded(reason)
+	case "WRITE_RECOVERED":
+		recordWriteRecovered()
+	}
+
 	if !m.transitionLogEnabled {
 		return
 	}
@@ -281,6 +295,7 @@ func (m *writeHealthMonitor) blockPut(w http.ResponseWriter, r *http.Request, bl
 }
 
 func (m *writeHealthMonitor) logPutBlocked(method, path, blockReason string) {
+	recordPutBlocked(blockReason)
 	if !m.transitionLogEnabled {
 		return
 	}

@@ -69,6 +69,7 @@ var (
 
 const (
 	prometheusMetricsPath = "/.prometheus/metrics"
+	metricsPath           = "/metrics"
 )
 
 func init() {
@@ -184,6 +185,7 @@ func (b *Backend) setOffline() {
 		return
 	}
 	atomic.StoreInt32(&b.up, offline)
+	setBackendUpMetric(b.endpoint, false)
 	if m := globalWriteHealth.Load(); m != nil {
 		m.forceDegrade(blockReasonS3BackendDown)
 	}
@@ -191,6 +193,7 @@ func (b *Backend) setOffline() {
 
 func (b *Backend) setOnline() {
 	atomic.StoreInt32(&b.up, online)
+	setBackendUpMetric(b.endpoint, true)
 }
 
 // Online returns true if backend is up
@@ -246,6 +249,7 @@ func registerMetricsRouter(router *mux.Router) error {
 		return err
 	}
 	router.Handle(prometheusMetricsPath, handler)
+	router.Handle(metricsPath, handler)
 	return nil
 }
 
@@ -662,6 +666,7 @@ func configureSite(ctx *cli.Context, siteNum int, siteStrs []string, healthCheck
 		backend := &Backend{siteNum, endpoint, proxy, &http.Client{
 			Transport: proxy.Transport,
 		}, 0, healthCheckURL, healthCheckDuration, &stats}
+		setBackendUpMetric(endpoint, false)
 		go backend.healthCheck()
 		proxy.ErrorHandler = backend.ErrorHandler
 		backends = append(backends, backend)

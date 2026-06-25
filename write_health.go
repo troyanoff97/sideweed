@@ -30,9 +30,10 @@ type writeHealthConfig struct {
 }
 
 type writeHealthCheck struct {
-	name       string
-	url        string
-	expectCode int
+	name           string
+	url            string
+	expectCode     int
+	visibilityOnly bool // true = does not affect write gate
 }
 
 type writeHealthMonitor struct {
@@ -129,7 +130,7 @@ func (m *writeHealthMonitor) probeAll() probeRound {
 	for r := range ch {
 		pr := probeResultFromOutcome(r.check, r.out)
 		probes = append(probes, pr)
-		if r.out.err != nil {
+		if !r.check.visibilityOnly && r.out.err != nil {
 			reasons = append(reasons, fmt.Sprintf("%s: %v", r.check.name, r.out.err))
 		}
 	}
@@ -152,6 +153,7 @@ func probeResultFromOutcome(check writeHealthCheck, out probeOutcome) writeProbe
 		Name:      check.name,
 		URL:       check.url,
 		OK:        out.err == nil,
+		Blocking:  !check.visibilityOnly,
 		LatencyMS: out.latency.Milliseconds(),
 		CheckedAt: time.Now().UTC().Format(time.RFC3339),
 	}
@@ -175,6 +177,10 @@ func sortProbeResults(probes []writeProbeLastResult) {
 			return 2
 		case "assign":
 			return 3
+		case "volume1":
+			return 4
+		case "volume2":
+			return 5
 		default:
 			return 100
 		}
@@ -401,6 +407,15 @@ func parseWriteHealthCheckFlag(raw string) (writeHealthCheck, error) {
 		urlPart = urlPart[:bar]
 	}
 	return writeHealthCheck{name: name, url: urlPart, expectCode: expectCode}, nil
+}
+
+func parseWriteHealthVisibilityCheckFlag(raw string) (writeHealthCheck, error) {
+	check, err := parseWriteHealthCheckFlag(raw)
+	if err != nil {
+		return writeHealthCheck{}, err
+	}
+	check.visibilityOnly = true
+	return check, nil
 }
 
 func parseHTTPStatusCode(s string) (int, error) {

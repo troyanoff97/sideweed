@@ -729,6 +729,13 @@ func sideweedMain(ctx *cli.Context) {
 		}
 		writeChecks = append(writeChecks, check)
 	}
+	for _, raw := range ctx.GlobalStringSlice("write-health-visibility-check") {
+		check, err := parseWriteHealthVisibilityCheckFlag(raw)
+		if err != nil {
+			console.Fatalln(err)
+		}
+		writeChecks = append(writeChecks, check)
+	}
 
 	var sites []*site
 	for i, siteStrs := range ctx.Args() {
@@ -846,7 +853,11 @@ func main() {
 		},
 		cli.StringSliceFlag{
 			Name:  "write-health-check",
-			Usage: "write health probe as name=url[|expectedStatus] (repeatable)",
+			Usage: "write health probe as name=url[|expectedStatus] (repeatable, blocking)",
+		},
+		cli.StringSliceFlag{
+			Name:  "write-health-visibility-check",
+			Usage: "non-blocking visibility probe as name=url[|expectedStatus] (repeatable; does not affect write gate)",
 		},
 		cli.BoolFlag{
 			Name:  "log, l",

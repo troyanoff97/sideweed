@@ -12,6 +12,7 @@ type writeProbeLastResult struct {
 	Name       string `json:"name"`
 	URL        string `json:"url"`
 	OK         bool   `json:"ok"`
+	Blocking   bool   `json:"blocking"`
 	StatusCode int    `json:"status_code,omitempty"`
 	LatencyMS  int64  `json:"latency_ms"`
 	Error      string `json:"error,omitempty"`

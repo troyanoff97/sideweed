@@ -23,6 +23,56 @@ func TestParseWriteHealthCheckFlag(t *testing.T) {
 	}
 }
 
+func TestWriteHealthMonitorVisibilityProbeDoesNotDegrade(t *testing.T) {
+	okSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer okSrv.Close()
+
+	downSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer downSrv.Close()
+
+	cfg := writeHealthConfig{
+		enabled:            true,
+		interval:           time.Hour,
+		unhealthyThreshold: 1,
+		recoveryThreshold:  1,
+		putBlockStatus:     http.StatusServiceUnavailable,
+		timeout:            time.Second,
+		checks: []writeHealthCheck{
+			{name: "assign", url: okSrv.URL},
+			{name: "volume1", url: downSrv.URL, visibilityOnly: true},
+		},
+	}
+	m := newWriteHealthMonitor(cfg, false)
+	m.runOnce()
+	if !m.writeAllowed() {
+		t.Fatal("expected healthy when only visibility probe failed")
+	}
+
+	probes := m.lastProbeResultsSnapshot()
+	if len(probes) != 2 {
+		t.Fatalf("probes=%+v", probes)
+	}
+	for _, p := range probes {
+		if p.Name == "volume1" {
+			if p.OK || p.Blocking {
+				t.Fatalf("volume1 probe=%+v want ok=false blocking=false", p)
+			}
+		}
+	}
+}
+
+func (m *writeHealthMonitor) lastProbeResultsSnapshot() []writeProbeLastResult {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]writeProbeLastResult, len(m.lastProbeResults))
+	copy(out, m.lastProbeResults)
+	return out
+}
+
 func TestWriteHealthMonitorDegradesOnAssignFailure(t *testing.T) {
 	master := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
